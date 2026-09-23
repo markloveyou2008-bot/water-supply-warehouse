@@ -1276,39 +1276,157 @@ CREATE POLICY "Allow public all access" ON warehouse_inventory
             showToast('ส่งออกไฟล์ Excel สำเร็จ', 'success');
         }
 
-        function handleExcelImport(e) {
+        function importFromExcel(e) {
             const file = e.target.files[0];
             if (!file) return;
 
             const reader = new FileReader();
-            reader.onload = function(event) {
-                try {
-                    const data = new Uint8Array(event.target.result);
-                    const workbook = XLSX.read(data, { type: 'array' });
-                    const firstSheet = workbook.Sheets[workbook.SheetNames[0]];
-                    const json = XLSX.utils.sheet_to_json(firstSheet);
+            reader.onload = async function(evt) {
+                let debugInfo = {
+                    fileName: file.name,
+                    fileSize: file.size + " bytes",
+                    sheetNames: [],
+                    selectedSheet: "",
+                    rawRowsCount: 0,
+                    headersDetected: [],
+                    rowsBeforeValidation: 0,
+                    rowsPassedValidation: 0,
+                    rowsRejected: 0,
+                    rejectReasons: [],
+                    recordsSentToSupabase: 0,
+                    supabaseResponse: null,
+                    supabaseError: null,
+                    recordsAfterQuery: 0
+                };
 
-                    let importedCount = 0;
-                    json.forEach(row => {
-                        const code = row['รหัสพัสดุ (Code)'] || row['Code'] || row['รหัส'] || row['code'];
-                        const name = row['ชื่อพัสดุ (Name)'] || row['Name'] || row['ชื่อ'] || row['name'];
-                        if (code && name) {
-                            const item = {
-                                id: Date.now().toString() + Math.random().toString(36).substring(2, 5),
-                                code: String(code),
-                                name: String(name),
-                                category: row['หมวดหมู่ (Category)'] || row['Category'] || row['หมวดหมู่'] || 'ทั่วไป',
-                                unit: row['หน่วยนับ (Unit)'] || row['Unit'] || row['หน่วย'] || 'ชิ้น',
-                                quantity: parseFloat(row['จำนวนคงเหลือ (Quantity)'] || row['Quantity'] || row['จำนวน']) || 0,
-                                min_quantity: parseFloat(row['ขั้นต่ำใกล้หมด (Min Qty)'] || row['Min Qty'] || row['ขั้นต่ำ']) || 5,
-                                critical_quantity: parseFloat(row['ขั้นต่ำวิกฤติ (Critical Qty)'] || row['Critical Qty']) || 2,
-                                location: row['ตำแหน่งจัดเก็บ (Location)'] || row['Location'] || row['ตำแหน่ง'] || ''
-                            };
-                            inventory.push(item);
-                            syncItemToDatabase(item);
-                            importedCount++;
+                try {
+                    if (typeof XLSX === 'undefined') {
+                        throw new Error('SheetJS library not loaded');
+                    }
+
+                    const data = new Uint8Array(evt.target.result);
+                    const workbook = XLSX.read(data, { type: 'array' });
+                    debugInfo.sheetNames = workbook.SheetNames;
+                    
+                    const firstSheetName = workbook.SheetNames[0];
+                    debugInfo.selectedSheet = firstSheetName;
+                    const worksheet = workbook.Sheets[firstSheetName];
+                    
+                    const rows = XLSX.utils.sheet_to_json(worksheet, { header: 1 });
+                    debugInfo.rawRowsCount = rows.length;
+
+                    let importedItems = [];
+                    let rejectReasonsList = [];
+
+                    rows.forEach((row, index) => {
+                        if (!row || row.length === 0) return;
+                        
+                        let cells = row.map(c => String(c !== undefined && c !== null ? c : '').trim());
+                        let fullText = cells.join(' ');
+
+                        if (index === 0) {
+                            debugInfo.headersDetected = cells.filter(c => c !== '');
+                        }
+
+                        if (fullText.includes('รหัสพัสดุ') || fullText.includes('ชื่อพัสดุ') || fullText.includes('ตรวจสอบรายละเอียด')) {
+                            return; // ข้าม header row
+                        }
+
+                        debugInfo.rowsBeforeValidation++;
+
+                        let code = cells.find(c => /^\d{5,}/.test(c)) || cells[0];
+                        let name = cells.find(c => c.length > 3 && !/^\d+$/.test(c)) || cells[1];
+                        let unit = cells.find(c => ['EA', 'ท่อน', 'ตัว', 'ชุด', 'อัน', 'กล่อง', 'ม้วน'].includes(c)) || 'EA';
+                        
+                        let qty = 0;
+                        for (let c of cells) {
+                            if (/^\d+$/.test(c) && c !== code) {
+                                qty = parseInt(c);
+                            }
+                        }
+
+                        if (code && name && code !== '') {
+                            importedItems.push({
+                                code: code,
+                                name: name,
+                                qty: qty,
+                                unit: unit
+                            });
+                            debugInfo.rowsPassedValidation++;
+                        } else {
+                            debugInfo.rowsRejected++;
+                            rejectReasonsList.push(`Row \({index}: Missing code or name (Code:\){code}, Name: ${name})`);
                         }
                     });
+
+                    debugInfo.rejectReasons = rejectReasonsList;
+                    debugInfo.recordsSentToSupabase = importedItems.length;
+
+                    if (importedItems.length > 0) {
+                        inventory = importedItems;
+                        saveData();
+                        renderInventory();
+
+                        if (supabaseClient) {
+                            const records = inventory.map(item => ({
+                                item_code: item.code,
+                                item_name: item.name,
+                                quantity: item.qty,
+                                unit: item.unit
+                            }));
+                            const { data: upsertData, error: upsertError } = await supabaseClient
+                                .from('warehouse_inventory')
+                                .upsert(records, { onConflict: 'item_code' });
+                            
+                            debugInfo.supabaseResponse = upsertData;
+                            debugInfo.supabaseError = upsertError;
+
+                            const { data: queryData, error: queryError } = await supabaseClient
+                                .from('warehouse_inventory')
+                                .select('*');
+                            
+                            if (!queryError && queryData) {
+                                debugInfo.recordsAfterQuery = queryData.length;
+                                inventory = queryData.map(d => ({
+                                    code: d.item_code,
+                                    name: d.item_name,
+                                    qty: d.quantity,
+                                    unit: d.unit
+                                }));
+                                localStorage.setItem('water_inventory', JSON.stringify(inventory));
+                                renderInventory();
+                            }
+                        }
+
+                        alert(`นำเข้าข้อมูลสำเร็จทั้งหมด ${importedItems.length} รายการ!`);
+                    } else {
+                        alert('ไม่พบข้อมูลพัสดุในไฟล์ Excel กรุณาตรวจสอบว่ามี รหัสพัสดุ และชื่อพัสดุ ชัดเจนหรือไม่');
+                    }
+
+                } catch (err) {
+                    debugInfo.supabaseError = err.message;
+                    alert('เกิดข้อผิดพลาดในการอ่านไฟล์ Excel: ' + err.message);
+                }
+
+                console.group("=== EXCEL IMPORT DEBUG LOGS ===");
+                console.log("File Name:", debugInfo.fileName);
+                console.log("File Size:", debugInfo.fileSize);
+                console.log("Sheet Names:", debugInfo.sheetNames);
+                console.log("Selected Sheet:", debugInfo.selectedSheet);
+                console.log("Raw Rows Count:", debugInfo.rawRowsCount);
+                console.log("Headers Detected:", debugInfo.headersDetected);
+                console.log("Rows Before Validation:", debugInfo.rowsBeforeValidation);
+                console.log("Rows Passed Validation:", debugInfo.rowsPassedValidation);
+                console.log("Rows Rejected:", debugInfo.rowsRejected);
+                console.log("Reject Reasons:", debugInfo.rejectReasons);
+                console.log("Records Sent to Supabase:", debugInfo.recordsSentToSupabase);
+                console.log("Supabase Error:", debugInfo.supabaseError);
+                console.log("Records After Query:", debugInfo.recordsAfterQuery);
+                console.groupEnd();
+            };
+            reader.readAsArrayBuffer(file);
+            e.target.value = '';
+        }
 
                     closeModal('modal-import');
                     renderInventoryTable();
